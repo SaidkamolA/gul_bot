@@ -1,0 +1,193 @@
+from aiogram import Router, Bot
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, Message
+from aiogram.types.input_file import BufferedInputFile  # Use BufferedInputFile instead
+from aiogram.filters import Command
+import requests
+from config import ADMIN_CHAT_ID, BACKEND_URL
+
+router = Router()
+
+# Handle "/start" command
+@router.message(Command("start"))
+async def handle_start(message: Message, bot: Bot):
+    if message.chat.id != ADMIN_CHAT_ID:
+        await message.answer("Вы не администратор!")
+        return
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📜 Одобренные", callback_data="view_approved")],
+        [InlineKeyboardButton(text="🚫 Отклонённые", callback_data="view_rejected")],
+        [InlineKeyboardButton(text="⏳ Ожидающие", callback_data="view_pending")]
+    ])
+
+    await message.answer(
+        "Добро пожаловать в админ-бота! Выберите действие:",
+        reply_markup=keyboard
+    )
+
+# Handle "Approve" / "Reject" button presses
+@router.callback_query(lambda c: c.data.startswith(('approve_', 'reject_')))
+async def handle_approval(callback_query: CallbackQuery, bot: Bot):
+    action, order_id = callback_query.data.split('_', 1)
+    status = "approved" if action == "approve" else "rejected"
+
+    try:
+        response = requests.patch(
+            f"{BACKEND_URL}{order_id}/",
+            json={'status': status},
+            headers={'Content-Type': 'application/json'}
+        )
+        response.raise_for_status()
+
+        await bot.answer_callback_query(callback_query.id, f"Статус изменён на: {status}")
+        await bot.edit_message_reply_markup(
+            chat_id=callback_query.message.chat.id,
+            message_id=callback_query.message.message_id,
+            reply_markup=None
+        )
+    except requests.RequestException as e:
+        error_msg = f"Ошибка обновления статуса: {str(e)} - Response: {e.response.text if e.response else 'No response'}"
+        print(error_msg)
+        await bot.answer_callback_query(callback_query.id, "Ошибка при обновлении статуса")
+
+# Handlers for viewing orders by status
+@router.callback_query(lambda c: c.data in ['view_approved', 'view_rejected', 'view_pending'])
+async def handle_view_orders(callback_query: CallbackQuery, bot: Bot):
+    status_map = {
+        'view_approved': 'approved',
+        'view_rejected': 'rejected',
+        'view_pending': 'pending'
+    }
+    status = status_map[callback_query.data]
+
+    try:
+        response = requests.get(f"{BACKEND_URL}?status={status}")
+        response.raise_for_status()
+        orders = response.json()
+
+        if not orders:
+            await bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=f"Нет заказов со статусом '{status}'."
+            )
+        else:
+            if status == 'pending':
+                # For pending orders, send each with receipt and buttons
+                base_url = BACKEND_URL.replace('/api/orders/', '')  # e.g., http://192.168.0.108:8000/
+                for order in orders:
+                    caption = (
+                        f"🛒 Заказ #{order['id']}\n"
+                        f"Имя: {order['name']}\n"
+                        f"Время: {order['created_at']}\n"
+                        f"Телефон: {order['phone']}\n"
+                        f"Товар: {order['product']}\n"
+                        f"Количество: {order['quantity']}\n"
+                        f"Статус: {order['status']}\n"
+                    )
+                    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve_{order['id']}")],
+                        [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{order['id']}")]
+                    ])
+                    receipt_url = order['receipt'] if order['receipt'].startswith('http') else f"{base_url}{order['receipt']}"
+
+                    try:
+                        print(f"Fetching receipt from: {receipt_url}")
+                        receipt_response = requests.get(receipt_url)
+                        receipt_response.raise_for_status()
+
+                        # Use BufferedInputFile for in-memory bytes
+                        receipt_file = BufferedInputFile(receipt_response.content, filename=f"receipt_{order['id']}.jpg")
+                        await bot.send_photo(
+                            chat_id=ADMIN_CHAT_ID,
+                            photo=receipt_file,
+                            caption=caption,
+                            reply_markup=keyboard
+                        )
+                    except requests.RequestException as e:
+                        print(f"Ошибка при загрузке чека: {e}")
+                        await bot.send_message(
+                            chat_id=ADMIN_CHAT_ID,
+                            text=f"{caption}\nОшибка: Не удалось загрузить чек.",
+                            reply_markup=keyboard
+                        )
+                    except Exception as e:
+                        print(f"Ошибка при отправке фото: {e}")
+                        await bot.send_message(
+                            chat_id=ADMIN_CHAT_ID,
+                            text=f"{caption}\nОшибка: Не удалось отправить чек.",
+                            reply_markup=keyboard
+                        )
+            else:
+                # For approved/rejected, send as a single text message
+                message = f"Заказы со статусом '{status}':\n\n"
+                for order in orders:
+                    message += (
+                        f"Заказ #{order['id']}\n"
+                        f"Имя: {order['name']}\n"
+                        f"Время: {order['created_at']}\n"
+                        f"Телефон: {order['phone']}\n"
+                        f"Товар: {order['product']}\n"
+                        f"Количество: {order['quantity']}\n"
+                        f"Статус: {order['status']}\n\n"
+                    )
+                await bot.send_message(
+                    chat_id=ADMIN_CHAT_ID,
+                    text=message
+                )
+        await bot.answer_callback_query(callback_query.id)
+    except requests.RequestException as e:
+        print(f"Ошибка при получении заказов: {e}")
+        await bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=f"Ошибка при загрузке заказов со статусом '{status}'."
+        )
+        await bot.answer_callback_query(callback_query.id)
+
+# Function to send order to Telegram admin
+async def send_order_to_admin(bot: Bot, order):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve_{order['id']}")],
+        [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{order['id']}")]
+    ])
+
+    caption = (
+        f"🛒 Новый заказ #{order['id']}\n"
+        f"Имя: {order['name']}\n"
+        f"Время: {order['created_at']}\n"
+        f"Телефон: {order['phone']}\n"
+        f"Товар: {order['product']}\n"
+        f"Количество: {order['quantity']}\n"
+    )
+
+    # Construct the correct receipt URL
+    base_url = BACKEND_URL.replace('/api/orders/', '')  # e.g., http://192.168.0.108:8000/
+    receipt_url = order['receipt'] if order['receipt'].startswith('http') else f"{base_url}{order['receipt']}"
+
+    try:
+        print(f"Fetching receipt from: {receipt_url}")  # Debug log
+        receipt_response = requests.get(receipt_url)
+        receipt_response.raise_for_status()
+
+        # Use BufferedInputFile for in-memory bytes
+        receipt_file = BufferedInputFile(receipt_response.content, filename=f"receipt_{order['id']}.jpg")
+        await bot.send_photo(
+            chat_id=ADMIN_CHAT_ID,
+            photo=receipt_file,
+            caption=caption,
+            reply_markup=keyboard
+        )
+    except requests.RequestException as e:
+        print(f"Ошибка при загрузке чека: {e}")
+        await bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=f"{caption}\nОшибка: Не удалось загрузить чек.",
+            reply_markup=keyboard
+        )
+    except Exception as e:
+        print(f"Ошибка при отправке фото: {e}")
+        await bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=f"{caption}\nОшибка: Не удалось отправить чек.",
+            reply_markup=keyboard
+        )
+
